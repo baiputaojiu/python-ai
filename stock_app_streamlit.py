@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import textwrap
 from datetime import datetime
@@ -8,6 +9,7 @@ import yfinance as yf
 import pandas as pd
 import mplfinance as mpf
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from io import BytesIO
 import requests
 
@@ -15,6 +17,27 @@ try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+
+def _configure_matplotlib_font():
+    preferred_fonts = [
+        "Yu Gothic",
+        "YuGothic",
+        "Meiryo",
+        "MS Gothic",
+        "Hiragino Sans",
+        "Noto Sans CJK JP",
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for font in preferred_fonts:
+        if font in available:
+            plt.rcParams["font.family"] = font
+            break
+    else:
+        plt.rcParams["font.family"] = "DejaVu Sans"
+
+
+_configure_matplotlib_font()
 
 
 # ----------------------------------------
@@ -214,47 +237,66 @@ def _extract_date_after_label(content: str, label: str):
 
 
 def _extract_event_dates(content: str):
-    earnings_date = _extract_date_after_label(content, "決算予定日")
-    rights_date = _extract_date_after_label(content, "権利付き最終日")
+    content = (content or "").strip()
+    quarter_labels = ["第1四半期", "第2四半期", "第3四半期", "通期"]
+    quarter_dates = {}
+    rights_date = None
 
-    # フォールバック：単純な ISO 形式
-    if earnings_date is None:
-        match = re.search(r"決算予定日\s*[：:]\s*(\d{4}-\d{2}-\d{2})", content)
-        if match:
-            earnings_date = match.group(1)
+    if not content:
+        return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+
+    # Try comma-separated values first
+    parts = [p.strip() for p in content.split(",") if p.strip()]
+    if len(parts) >= 5:
+        for label, value in zip(quarter_labels, parts[:4]):
+            quarter_dates[label] = value
+        rights_date = parts[4]
+        return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+
+    # Fallback: try JSON
+    try:
+        parsed = json.loads(content)
+        quarter_dates = parsed.get("quarter_dates") or {}
+        rights_date = parsed.get("rights_date")
+        return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+    except Exception:
+        pass
+
+    # Fallback: try sentence parsing looking for labels
+    for label in quarter_labels:
+        extracted = _extract_date_after_label(content, f"{label}決算")
+        if extracted:
+            quarter_dates[label] = extracted
+    rights_date = _extract_date_after_label(content, "権利付き最終日")
     if rights_date is None:
         match = re.search(r"権利付き最終日\s*[：:]\s*(\d{4}-\d{2}-\d{2})", content)
         if match:
             rights_date = match.group(1)
 
-    return {"earnings_date": earnings_date, "rights_date": rights_date}
+    return {"quarter_dates": quarter_dates, "rights_date": rights_date}
 
 
 def get_events_by_openai(code: str):
     if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
-        return {"earnings_date": None, "rights_date": None, "earnings_summary": None}
+        return {
+            "quarter_dates": {},
+            "rights_date": None,
+            "raw_response": None,
+            "error": "OpenAI API unavailable",
+        }
 
     client = OpenAI()
     prompt = textwrap.dedent(
         f"""
-        日本株 {code} の決算発表予定と権利付き最終日をインターネット検索して調べてください。
-        必ず複数の信頼できる日本の金融サイト（Yahoo!ファイナンス、株探、SBI、楽天証券、IR情報など）を参照し、
-        最新期の予定と根拠となる公開情報（正式な日付や予定時期）を確認してください。
-
-        出力形式（絶対に変更しないこと）:
-        - **第1四半期決算**：テキスト
-        - **第2四半期決算**：テキスト
-        - **第3四半期決算**：テキスト
-        - **通期決算（本決算）**：テキスト
-
-        各テキストには「YYYY年M月D日」「YYYY年M月上旬」などの形で予定時期や日時を含め、
-        補足の説明や根拠サイト（例: global.toyota）を括弧付きで示してください。
-        その後に改行して以下の行を付けてください:
-        権利付き最終日: YYYY-MM-DD
+        日本株 {code} について、最新または最も確からしい決算発表予定と権利付き最終日を信頼できる日本語ソースや過去実績から推定して調べてください。
+        回答は「第1四半期・第2四半期・第3四半期・通期・権利付き最終日」の順に、半角カンマ区切りで 5 つの日付文字列のみを返してください。
+        例: 2025年8月上旬,2025年11月上旬,2026年2月上旬,2026年5月上旬,2026-03-27
+        厳密な日付が不明でも「2025年8月上旬」「2026年2月中旬」のように幅を持たせた表現を必ず記載してください。
+        情報が全く得られない場合のみ「情報未取得」と記載してください。それ以外の文章・JSON・説明は一切出力しないでください。
         """
     ).strip()
 
-    result = {"earnings_date": None, "rights_date": None, "earnings_summary": None}
+    result = {"quarter_dates": {}, "rights_date": None, "raw_response": None, "error": None}
     try:
         response = client.chat.completions.create(
             model="gpt-4o-search-preview",
@@ -276,16 +318,31 @@ def get_events_by_openai(code: str):
                 {"role": "user", "content": prompt},
             ],
         )
-        content = (response.choices[0].message.content or "").strip()
-        if content:
-            result["earnings_summary"] = content
+        choice = response.choices[0]
+        message_content = choice.message.content
+        if isinstance(message_content, list):
+            parts = []
+            for block in message_content:
+                if isinstance(block, dict) and block.get("type") == "output_text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, dict) and "text" in block:
+                    parts.append(block["text"])
+                elif isinstance(block, str):
+                    parts.append(block)
+            content = "".join(parts).strip()
+        else:
+            content = (message_content or "").strip()
+
+        if not content:
+            result["raw_response"] = response.model_dump_json(indent=2, ensure_ascii=False)
+            result["error"] = "OpenAI response contained no text content."
+        else:
+            result["raw_response"] = content
             extracted = _extract_event_dates(content)
-            if extracted.get("earnings_date"):
-                result["earnings_date"] = extracted["earnings_date"]
-            if extracted.get("rights_date"):
-                result["rights_date"] = extracted["rights_date"]
-    except Exception:
-        pass
+            result["quarter_dates"] = extracted.get("quarter_dates") or {}
+            result["rights_date"] = extracted.get("rights_date")
+    except Exception as exc:
+        result["error"] = str(exc)
 
     return result
 
@@ -295,51 +352,15 @@ def get_events_info(code: str):
         normalized = normalized.zfill(4)
     symbol = f"{normalized}.T"
 
-    rights_date = None
-    rights_source = None
-
-    try:
-        ticker = yf.Ticker(symbol)
-    except Exception:
-        ticker = None
-
-    if ticker is not None:
-        try:
-            cal = ticker.get_calendar()
-            if cal is not None and not cal.empty:
-                cal_series = cal["Value"] if "Value" in cal.columns else cal.iloc[:, 0]
-                rights_date = _to_iso_date(cal_series.get("Ex-Dividend Date"))
-                if rights_date:
-                    rights_source = "yahoo"
-        except Exception:
-            pass
-
-        if rights_date is None:
-            try:
-                info = ticker.get_info()
-                rights_date = _to_iso_date(info.get("exDividendDate"))
-                if rights_date:
-                    rights_source = "yahoo"
-            except Exception:
-                pass
-
     ai_result = get_events_by_openai(normalized)
-    earnings_summary = ai_result.get("earnings_summary")
-    earnings_date = ai_result.get("earnings_date")
-    sources = {"earnings": "openai"}
-
-    if rights_date is None and ai_result.get("rights_date"):
-        rights_date = ai_result["rights_date"]
-        rights_source = "openai"
-
-    if rights_source:
-        sources["rights"] = rights_source
+    quarter_dates = ai_result.get("quarter_dates") or {}
+    rights_date = ai_result.get("rights_date")
 
     return {
-        "earnings_summary": earnings_summary,
-        "earnings_date": earnings_date,
+        "quarter_dates": quarter_dates,
         "rights_date": rights_date,
-        "sources": sources,
+        "raw_response": ai_result.get("raw_response"),
+        "error": ai_result.get("error"),
     }
 
 
@@ -381,38 +402,165 @@ def create_candlestick_image(df: pd.DataFrame, title: str) -> BytesIO:
 # ----------------------------------------
 # Streamlit UI
 # ----------------------------------------
-st.title("📈 株価表示アプリ（強化版 Streamlit）")
+st.set_page_config(
+    page_title="株価表示アプリ",
+    page_icon="📈",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+    .stock-card {
+        background-color: #f8f9fb;
+        border: 1px solid #e5e8ef;
+        border-radius: 14px;
+        padding: 18px;
+        margin-bottom: 24px;
+        box-shadow: 0 2px 4px rgba(18, 38, 63, 0.06);
+    }
+    .stock-card h2 {
+        margin-top: 0;
+    }
+    .metric-row {
+        display: flex;
+        gap: 12px;
+    }
+    .metric-row > div {
+        flex: 1;
+    }
+    .chart-wrapper {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("📈 株価表示アプリ (Streamlit 強化版)")
 
 period_map = {
-    "1ヶ月": "1mo",
-    "3ヶ月": "3mo",
-    "6ヶ月": "6mo",
+    "1か月": "1mo",
+    "3か月": "3mo",
+    "6か月": "6mo",
     "1年": "1y",
     "5年": "5y",
+}
+period_label_short = {
+    "1か月": "1M",
+    "3か月": "3M",
+    "6か月": "6M",
+    "1年": "1Y",
+    "5年": "5Y",
 }
 
 period_label = st.selectbox("期間を選択してください", list(period_map.keys()))
 period = period_map[period_label]
+header_period = period_label_short.get(period_label, period_label)
 
 st.write(f"選択中の期間: **{period_label} ({period})**")
+show_events = st.checkbox(
+    "決算予定日・権利付き最終日も表示する（AI検索を含むためコストが発生します）",
+    value=False,
+)
 
 st.markdown("---")
+st.write("銘柄の指定方法:")
+st.write("- 銘柄コード（例: 7203）")
+st.write("- 複数コード（例: 7203, 6758, 9984）")
+st.write("- 銘柄名（例: トヨタ） → 自動で検索")
 
-st.write("銘柄の指定方法：")
-st.write("- **銘柄コード（例: 7203）**")
-st.write("- **複数コード（例: 7203, 6758, 9984）**")
-st.write("- **銘柄名（例: トヨタ） → 自動で検索**")
+keyword = st.text_input("銘柄コード または 銘柄名（カンマ区切り可）")
 
-keyword = st.text_input("銘柄コード または 銘柄名")
+
+def render_stock_panel(code: str):
+    result = fetch_stock_info(code, period=period)
+
+    if result is None:
+        st.error(f"[{code}] の株価データを取得できませんでした。")
+        return
+
+    st.markdown("<div class='stock-card'>", unsafe_allow_html=True)
+    st.markdown(
+        f"### {result['code']} | {result['name']}  (Period: {header_period})"
+    )
+
+    latest = result["latest"]
+    diff = result["diff"]
+    diff_percent = result["diff_percent"]
+
+    col_metrics = st.columns(3)
+    with col_metrics[0]:
+        st.metric("終値", f"{latest['Close']:.2f} 円")
+        st.write(f"始値: {latest['Open']:.2f} 円")
+    with col_metrics[1]:
+        st.metric("高値", f"{latest['High']:.2f} 円")
+        st.write(f"安値: {latest['Low']:.2f} 円")
+    with col_metrics[2]:
+        if diff is not None and diff_percent is not None:
+            st.metric("前日比", f"{diff:+.2f} 円", f"{diff_percent:+.2f}%")
+        else:
+            st.metric("前日比", "--", "--")
+        st.write(f"出来高: {int(latest['Volume']):,}")
+
+    content_cols = st.columns([3, 2])
+    with content_cols[0]:
+        try:
+            img = create_candlestick_image(
+                result["data"], f"{result['code']} {result['name']} ({period_label})"
+            )
+            st.image(img, width="stretch")
+        except Exception as e:
+            st.error(f"チャート生成に失敗しました: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        csv = result["data"].to_csv().encode("utf-8")
+        st.download_button(
+            label="📥 CSV をダウンロード",
+            data=csv,
+            file_name=f"{result['code']}_{period}.csv",
+            mime="text/csv",
+        )
+
+    with content_cols[1]:
+        if show_events:
+            with st.spinner("決算予定日と権利付き最終日を取得中..."):
+                events = get_events_info(result["code"])
+
+            quarter_dates = events.get("quarter_dates") or {}
+            rights_event = events.get("rights_date")
+            raw_response = events.get("raw_response")
+            error_message = events.get("error")
+
+            st.markdown("### 📅 決算予定日 (ChatGPT)")
+            order = ["第1四半期", "第2四半期", "第3四半期", "通期"]
+            for label in order:
+                value = quarter_dates.get(label) or "情報なし"
+                st.write(f"{label}: {value}")
+
+            st.markdown("### 🎯 権利付き最終日 (ChatGPT)")
+            st.write(rights_event or "情報なし")
+
+            with st.expander("GPTレスポンス（デバッグ）"):
+                if error_message:
+                    st.write(f"エラー: {error_message}")
+                st.code(raw_response or "レスポンスなし", language="json")
+        else:
+            st.caption("決算予定日・権利付き最終日の取得は現在オフになっています。")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 if st.button("株価を取得"):
-
     if not keyword.strip():
         st.warning("銘柄コードまたは銘柄名を入力してください。")
         st.stop()
 
     keyword = keyword.strip()
-
     codes = []
 
     if "," in keyword:
@@ -425,85 +573,23 @@ if st.button("株価を取得"):
             st.error("該当する銘柄が見つかりませんでした。")
             st.stop()
 
-        st.write("🔍 一致した候補：")
+        st.write("🔍 一致した候補:")
         for code, name in matches:
             st.write(f"- {code} : {name}")
 
         first_code, first_name = matches[0]
-        st.info(f"最初の候補 **{first_code} : {first_name}** を使用します。")
+        st.info(f"最初の候補 {first_code} : {first_name} を使用します。")
         codes = [first_code]
 
-    tabs = st.tabs([f"{code} の分析" for code in codes])
+    if not codes:
+        st.warning("表示する銘柄がありません。")
+        st.stop()
 
-    for tab, code in zip(tabs, codes):
-        with tab:
+    cols_per_row = min(3, len(codes)) if len(codes) > 1 else 1
 
-            result = fetch_stock_info(code, period=period)
-
-            if result is None:
-                st.error(f"[{code}] の株価データを取得できませんでした。")
-                continue
-
-            st.subheader(f"【{result['code']} | {result['name']}】（期間：{period_label}）")
-
-            latest = result["latest"]
-            diff = result["diff"]
-            diff_percent = result["diff_percent"]
-
-            st.write(f"**始値：** {latest['Open']:.2f} 円")
-            st.write(f"**高値：** {latest['High']:.2f} 円")
-            st.write(f"**安値：** {latest['Low']:.2f} 円")
-            st.write(f"**終値：** {latest['Close']:.2f} 円")
-            st.write(f"**出来高：** {int(latest['Volume']):,}")
-
-            if diff is not None and diff_percent is not None:
-                sign = "▲" if diff >= 0 else "▼"
-                st.write(f"**前日比：** {sign}{diff:.2f} 円 ({diff_percent:.2f}%)")
-            else:
-                st.write("前日比：データなし")
-
-            st.markdown("### 📅 決算予定日・権利付き最終日（最新情報）")
-            with st.spinner("最新の日付情報を取得しています..."):
-                events = get_events_info(result["code"])
-
-            earnings_summary = events.get("earnings_summary")
-            earnings_event = events.get("earnings_date")
-            rights_event = events.get("rights_date")
-            sources = events.get("sources") or {}
-            source_map = {
-                "openai": "ChatGPT（インターネット検索補完）",
-                "yahoo": "Yahoo Finance（yfinance）",
-            }
-
-            st.markdown("**決算予定スケジュール（ChatGPT調査）**")
-            if earnings_summary:
-                st.markdown(earnings_summary)
-            elif earnings_event:
-                st.write(f"決算予定日：{earnings_event}")
-            else:
-                st.write("決算予定：情報なし")
-            st.caption(f"取得元（決算）：{source_map.get(sources.get('earnings'), '情報なし')}")
-
-            st.write(f"**権利付き最終日：** {rights_event or '情報なし'}")
-            rights_source_label = source_map.get(sources.get("rights"), "情報なし")
-            st.caption(f"取得元（権利付き最終日）：{rights_source_label}")
-
-            # チャート（安全な try/except）
-            try:
-                img = create_candlestick_image(
-                    result["data"],
-                    f"{result['code']} {result['name']}（{period_label}）",
-                )
-                st.image(img)
-
-            except Exception as e:
-                st.error(f"チャート生成に失敗しました：{e}")
-                continue
-
-            csv = result["data"].to_csv().encode("utf-8")
-            st.download_button(
-                label="📥 CSV をダウンロード",
-                data=csv,
-                file_name=f"{result['code']}_{period}.csv",
-                mime="text/csv",
-            )
+    for i in range(0, len(codes), cols_per_row):
+        row_codes = codes[i:i + cols_per_row]
+        columns = st.columns(len(row_codes))
+        for column, code in zip(columns, row_codes):
+            with column:
+                render_stock_panel(code)
