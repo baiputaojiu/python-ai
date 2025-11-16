@@ -1,15 +1,51 @@
 {
   "7203": {
     "quarter_dates": {
-      "第1四半期": "2025年8月上旬",
-      "第2四半期": "2025年11月上旬",
-      "第3四半期": "2026年2月上旬",
-      "通期": "2026年5月上旬"
+      "第1四半期": "2025年8月12日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）",
+      "第2四半期": "2025年11月11日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）",
+      "第3四半期": "2026年2月4日（予定, https://motorhub.jp/toyota-earnings-schedule-guide/）",
+      "通期": "2026年5月14日（予定, https://motorhub.jp/toyota-earnings-schedule-guide/）"
+    },
+    "quarter_events": {
+      "第1四半期": {
+        "date": "2025-08-12",
+        "date_text": "2025年8月12日",
+        "kind": "前回",
+        "source_url": "https://motorhub.jp/toyota-earnings-schedule-guide/",
+        "display": "2025年8月12日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）"
+      },
+      "第2四半期": {
+        "date": "2025-11-11",
+        "date_text": "2025年11月11日",
+        "kind": "前回",
+        "source_url": "https://motorhub.jp/toyota-earnings-schedule-guide/",
+        "display": "2025年11月11日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）"
+      },
+      "第3四半期": {
+        "date": "2026-02-04",
+        "date_text": "2026年2月4日",
+        "kind": "予定",
+        "source_url": "https://motorhub.jp/toyota-earnings-schedule-guide/",
+        "display": "2026年2月4日（予定, https://motorhub.jp/toyota-earnings-schedule-guide/）"
+      },
+      "通期": {
+        "date": "2026-05-14",
+        "date_text": "2026年5月14日",
+        "kind": "予定",
+        "source_url": "https://motorhub.jp/toyota-earnings-schedule-guide/",
+        "display": "2026年5月14日（予定, https://motorhub.jp/toyota-earnings-schedule-guide/）"
+      }
     },
     "rights_date": "2026-03-27",
-    "raw_response": "2025年8月上旬,2025年11月上旬,2026年2月上旬,2026年5月上旬,2026-03-27",
+    "rights_event": {
+      "date": "2026-03-27",
+      "date_text": "2026年3月27日（予定｜https://motorhub.jp/toyota-dividend-schedule-maximization-guide/）",
+      "source_url": null,
+      "display": "2026年3月27日（予定｜https://motorhub.jp/toyota-dividend-schedule-maximization-guide/）"
+    },
+    "raw_response": "2025年8月12日（前回｜https://motorhub.jp/toyota-earnings-schedule-guide/）,2025年11月11日（前回｜https://motorhub.jp/toyota-earnings-schedule-guide/）,2026年2月4日（予定｜https://motorhub.jp/toyota-earnings-schedule-guide/）,2026年5月14日（予定｜https://motorhub.jp/toyota-earnings-schedule-guide/）,2026年3月27日（予定｜https://motorhub.jp/toyota-dividend-schedule-maximization-guide/）",
     "error": null,
-    "last_updated": "2025-11-16T05:46:09.570514+00:00"
+    "last_updated": "2025-11-16T07:01:22.990026+00:00"
   },
   "6758": {
     "quarter_dates": {
