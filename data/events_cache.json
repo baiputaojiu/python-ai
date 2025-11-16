@@ -2,7 +2,7 @@
   "7203": {
     "quarter_dates": {
       "第1四半期": "2025年8月12日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）",
-      "第2四半期": "2025年11月11日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）",
+      "第2四半期": "2025年11月20日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）",
       "第3四半期": "2026年2月4日（予定, https://motorhub.jp/toyota-earnings-schedule-guide/）",
       "通期": "2026年5月14日（予定, https://motorhub.jp/toyota-earnings-schedule-guide/）"
     },
@@ -15,11 +15,11 @@
         "display": "2025年8月12日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）"
       },
       "第2四半期": {
-        "date": "2025-11-11",
-        "date_text": "2025年11月11日",
+        "date": "2025-11-20",
+        "date_text": "2025年11月20日",
         "kind": "前回",
         "source_url": "https://motorhub.jp/toyota-earnings-schedule-guide/",
-        "display": "2025年11月11日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）"
+        "display": "2025年11月20日（前回, https://motorhub.jp/toyota-earnings-schedule-guide/）"
       },
       "第3四半期": {
         "date": "2026-02-04",

@@ -6,6 +6,8 @@
 出力     : なし（Streamlit へ描画）
 """
 
+from datetime import datetime, timedelta
+
 import streamlit as st
 
 from app.charts.candlestick import create_candlestick_image
@@ -95,6 +97,69 @@ def render_stock_panel(
         error_message = events.get("error")
         last_updated = events.get("last_updated")
         source_label = "キャッシュ" if events.get("from_cache") else "AI検索"
+
+        today = datetime.now().date()
+        two_week_limit = today + timedelta(days=14)
+        one_month_limit = today + timedelta(days=30)
+
+        def _parse_iso(date_str):
+            try:
+                return datetime.strptime(date_str, "%Y-%m-%d").date()
+            except Exception:
+                return None
+
+        upcoming_two_week = []
+        upcoming_one_month = []
+        for label, meta in quarter_events.items():
+            iso = meta.get("date")
+            dt = _parse_iso(iso)
+            if not dt or dt < today:
+                continue
+            if dt <= two_week_limit:
+                upcoming_two_week.append((label, meta))
+            elif dt <= one_month_limit:
+                upcoming_one_month.append((label, meta))
+
+        rights_two_week = None
+        rights_one_month = None
+        if rights_event and rights_event.get("date"):
+            dt = _parse_iso(rights_event.get("date"))
+            if dt and dt >= today:
+                if dt <= two_week_limit:
+                    rights_two_week = rights_event
+                elif dt <= one_month_limit:
+                    rights_one_month = rights_event
+
+        def _format_alert(label, meta):
+            date_text = meta.get("date_text") or meta.get("date") or "情報なし"
+            kind = meta.get("kind")
+            if kind:
+                return f"{label}: {date_text}（{kind}）"
+            return f"{label}: {date_text}"
+
+        alert_messages = []
+        if upcoming_two_week:
+            msg = " / ".join(_format_alert(label, meta) for label, meta in upcoming_two_week)
+            alert_messages.append(("warning", f"⚠️ 2週間以内に決算発表予定日があります: {msg}"))
+        if rights_two_week:
+            text = rights_two_week.get("date_text") or rights_two_week.get("date") or "情報なし"
+            alert_messages.append(
+                ("warning", f"⚠️ 2週間以内に権利付き最終日があります: {text}")
+            )
+        if upcoming_one_month:
+            msg = " / ".join(_format_alert(label, meta) for label, meta in upcoming_one_month)
+            alert_messages.append(("info", f"ℹ️ 1か月以内に決算発表予定日があります: {msg}"))
+        if rights_one_month:
+            text = rights_one_month.get("date_text") or rights_one_month.get("date") or "情報なし"
+            alert_messages.append(
+                ("info", f"ℹ️ 1か月以内に権利付き最終日があります: {text}")
+            )
+
+        for level, message in alert_messages:
+            if level == "warning":
+                st.warning(message)
+            else:
+                st.info(message)
 
         st.markdown("### 📅 決算予定日")
         order = ["第1四半期", "第2四半期", "第3四半期", "通期"]
