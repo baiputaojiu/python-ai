@@ -112,13 +112,21 @@ def run():
     keyword = keyword_input
 
     uploaded_image = st.file_uploader("画像をアップロード", type=["png", "jpg", "jpeg"])
+    from app.utils.ocr import OCR_BACKEND, BACKEND_TESSERACT, BACKEND_OPENAI
+
+    backend_label = {
+        BACKEND_TESSERACT: "Tesseract",
+        BACKEND_OPENAI: "OpenAI Vision",
+    }.get(OCR_BACKEND, "利用不可")
+    st.caption(f"OCRエンジン: {backend_label}")
+
     ocr_text = ""
     ocr_codes = []
     ocr_valid_codes = []
     ocr_result_cache = {}
     if uploaded_image is not None:
         try:
-            ocr_text = extract_text_from_image(uploaded_image)
+            ocr_text = extract_text_from_image(uploaded_file=uploaded_image)
             st.text_area("OCR結果", value=ocr_text or "※ テキストが検出されませんでした ※", height=200)
             ocr_codes = extract_stock_codes_from_text(ocr_text)
             if ocr_codes:
