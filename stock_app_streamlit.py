@@ -18,7 +18,6 @@ try:
 except ImportError:
     OpenAI = None
 
-
 def _configure_matplotlib_font():
     preferred_fonts = [
         "Yu Gothic",
@@ -276,6 +275,15 @@ def _extract_event_dates(content: str):
     return {"quarter_dates": quarter_dates, "rights_date": rights_date}
 
 
+def _normalize_code(code: str) -> str:
+    normalized = (code or "").strip()
+    if not normalized:
+        return ""
+    if normalized.isdigit():
+        normalized = normalized.zfill(4)
+    return normalized
+
+
 def get_events_by_openai(code: str):
     if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
         return {
@@ -346,11 +354,146 @@ def get_events_by_openai(code: str):
 
     return result
 
+
+def get_events_by_openai_batch(codes):
+    normalized_codes = []
+    seen = set()
+    for code in codes:
+        norm = _normalize_code(code)
+        if not norm or norm in seen:
+            continue
+        normalized_codes.append(norm)
+        seen.add(norm)
+
+    if not normalized_codes:
+        return {}
+
+    if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
+        return {
+            norm: {
+                "quarter_dates": {},
+                "rights_date": None,
+                "raw_response": None,
+                "error": "OpenAI API unavailable",
+            }
+            for norm in normalized_codes
+        }
+
+    client = OpenAI()
+    code_lines = "\n".join(f"- {c}" for c in normalized_codes)
+    prompt = textwrap.dedent(
+        f"""
+        以下の日本株コードそれぞれについて、最新または最も確からしい決算発表予定と権利付き最終日を信頼できる日本語ソースや過去実績から推定して調べてください。
+        各コードの回答は「第1四半期・第2四半期・第3四半期・通期・権利付き最終日」の順で日付を必ず示し、厳密な日付が不明でも「2025年8月上旬」「2026年2月中旬」のように幅を持たせた表現を記載してください。
+        情報が全く得られない場合のみ「情報未取得」と記載してください。それ以外の文章・JSON・説明は一切出力しないでください。
+
+        出力形式（1行につき1銘柄のみ）:
+        7203: 2025年8月上旬,2025年11月上旬,2026年2月上旬,2026年5月上旬,2026-03-27
+        6758: ...
+
+        対象コード:
+        {code_lines}
+        """
+    ).strip()
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-search-preview",
+            web_search_options={
+                "user_location": {
+                    "type": "approximate",
+                    "approximate": {
+                        "country": "JP",
+                        "city": "Tokyo",
+                        "region": "Tokyo",
+                    },
+                },
+            },
+            messages=[
+                {
+                    "role": "system",
+                    "content": "あなたは金融情報を調査するアシスタントです。信頼できる日本語ソースを検索し、最新の決算予定と権利付き最終日を整理して回答してください。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except Exception as exc:
+        return {
+            norm: {
+                "quarter_dates": {},
+                "rights_date": None,
+                "raw_response": None,
+                "error": str(exc),
+            }
+            for norm in normalized_codes
+        }
+
+    choice = response.choices[0]
+    message_content = choice.message.content
+    if isinstance(message_content, list):
+        parts = []
+        for block in message_content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        content = "".join(parts).strip()
+    else:
+        content = (message_content or "").strip()
+
+    raw_response = content or response.model_dump_json(indent=2, ensure_ascii=False)
+    if not content:
+        return {
+            norm: {
+                "quarter_dates": {},
+                "rights_date": None,
+                "raw_response": raw_response,
+                "error": "OpenAI response contained no text content.",
+            }
+            for norm in normalized_codes
+        }
+
+    quarter_labels = ["第1四半期", "第2四半期", "第3四半期", "通期"]
+    results = {
+        norm: {
+            "quarter_dates": {},
+            "rights_date": None,
+            "raw_response": raw_response,
+            "error": f"{norm} のデータを読み取れませんでした。",
+        }
+        for norm in normalized_codes
+    }
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    for line in lines:
+        if ":" not in line:
+            continue
+        code_part, values_part = line.split(":", 1)
+        code_part = code_part.strip()
+        if code_part not in results:
+            continue
+
+        values = [p.strip() for p in values_part.split(",") if p.strip()]
+        if len(values) < 5:
+            results[code_part]["error"] = f"{code_part} の値が不足しています。"
+            continue
+
+        quarter_dates = {label: value for label, value in zip(quarter_labels, values[:4])}
+        rights_date = values[4]
+
+        results[code_part] = {
+            "quarter_dates": quarter_dates,
+            "rights_date": rights_date,
+            "raw_response": raw_response,
+            "error": None if quarter_dates or rights_date else f"{code_part} のデータを読み取れませんでした。",
+        }
+
+    return results
+
 def get_events_info(code: str):
-    normalized = code.strip()
-    if normalized.isdigit():
-        normalized = normalized.zfill(4)
-    symbol = f"{normalized}.T"
+    normalized = _normalize_code(code)
 
     ai_result = get_events_by_openai(normalized)
     quarter_dates = ai_result.get("quarter_dates") or {}
@@ -362,6 +505,25 @@ def get_events_info(code: str):
         "raw_response": ai_result.get("raw_response"),
         "error": ai_result.get("error"),
     }
+
+
+def fetch_events_info_for_codes(codes):
+    normalized_codes = [_normalize_code(code) for code in codes if _normalize_code(code)]
+    if not normalized_codes:
+        return {}
+
+    if len(normalized_codes) == 1:
+        code = normalized_codes[0]
+        return {code: get_events_info(code)}
+
+    batch_results = get_events_by_openai_batch(normalized_codes)
+
+    # Ensure every requested code has an entry
+    for code in normalized_codes:
+        if code not in batch_results:
+            batch_results[code] = get_events_info(code)
+
+    return batch_results
 
 
 # ----------------------------------------
@@ -476,7 +638,7 @@ st.write("- 銘柄名（例: トヨタ） → 自動で検索")
 keyword = st.text_input("銘柄コード または 銘柄名（カンマ区切り可）")
 
 
-def render_stock_panel(code: str):
+def render_stock_panel(code: str, events_cache=None):
     result = fetch_stock_info(code, period=period)
 
     if result is None:
@@ -528,8 +690,13 @@ def render_stock_panel(code: str):
 
     with content_cols[1]:
         if show_events:
-            with st.spinner("決算予定日と権利付き最終日を取得中..."):
-                events = get_events_info(result["code"])
+            events = None
+            if events_cache:
+                events = events_cache.get(result["code"])
+
+            if events is None:
+                with st.spinner("決算予定日と権利付き最終日を取得中..."):
+                    events = get_events_info(result["code"])
 
             quarter_dates = events.get("quarter_dates") or {}
             rights_event = events.get("rights_date")
@@ -585,6 +752,11 @@ if st.button("株価を取得"):
         st.warning("表示する銘柄がありません。")
         st.stop()
 
+    events_cache = {}
+    if show_events:
+        with st.spinner("選択した銘柄の決算予定日 (ChatGPT) をまとめて取得中..."):
+            events_cache = fetch_events_info_for_codes(codes)
+
     cols_per_row = min(3, len(codes)) if len(codes) > 1 else 1
 
     for i in range(0, len(codes), cols_per_row):
@@ -592,4 +764,4 @@ if st.button("株価を取得"):
         columns = st.columns(len(row_codes))
         for column, code in zip(columns, row_codes):
             with column:
-                render_stock_panel(code)
+                render_stock_panel(code, events_cache=events_cache if show_events else None)
