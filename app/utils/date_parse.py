@@ -1,16 +1,21 @@
 """
 ファイル名: date_parse.py
 目的     : 決算予定日や権利付き最終日のテキスト解析を担う
-概要     : 日付文字列の正規化、ラベルの後ろから日付を推定、GPT 応答からの抽出を実施する
-入力     : content(str): GPT などから返る決算情報テキスト
-出力     : dict: quarter_dates / rights_date を含む辞書
+概要     : GPT から返るテキストを解析し、日付・種別・出典 URL を抽出して整形する
+入力     : content(str): GPT 応答の文字列
+出力     : dict: quarter_dates / rights_date / quarter_events / rights_event を含む辞書
 """
+
+from __future__ import annotations
 
 import json
 import re
 from datetime import datetime
+from typing import Dict, Optional
 
 import pandas as pd
+
+QUARTER_LABELS = ["第1四半期", "第2四半期", "第3四半期", "通期"]
 
 
 def _to_iso_date(value):
@@ -53,7 +58,6 @@ def _parse_date_text(text: str):
     if not text:
         return None
 
-    # 全角→半角変換と記号統一を先に行う
     translate_table = str.maketrans(
         {
             "０": "0",
@@ -75,7 +79,6 @@ def _parse_date_text(text: str):
     )
     text = text.translate(translate_table)
     text = text.replace("年", "/").replace("月", "/").replace("日", "")
-    text = text.replace("：", ":")
 
     def _match_to_iso(match_obj):
         year, month, day = match_obj.groups()
@@ -132,32 +135,106 @@ def _extract_date_after_label(content: str, label: str):
     return None
 
 
-def _extract_event_dates(content: str):
-    """GPT 応答のテキストから四半期予定と権利日付を取り出す。"""
-    content = (content or "").strip()
-    quarter_labels = ["第1四半期", "第2四半期", "第3四半期", "通期"]
-    quarter_dates = {}
-    rights_date = None
+def _parse_quarter_value(value: str) -> Optional[dict]:
+    pattern = re.compile(
+        r"^\s*(?P<date>[^（(]+?)\s*[（(]\s*(?P<kind>予定|前回)\s*｜\s*(?P<url>https?://[^）)]+)\s*[）)]\s*$"
+    )
+    match = pattern.match(value.strip())
+    if not match:
+        return None
 
-    if not content:
-        return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+    date_text = match.group("date").strip()
+    kind = match.group("kind").strip()
+    url = match.group("url").strip()
+    iso_date = _parse_date_text(date_text) or date_text
+    return {
+        "date": iso_date,
+        "date_text": date_text,
+        "kind": kind,
+        "source_url": url,
+        "display": f"{date_text}（{kind}, {url}）",
+    }
+
+
+def _parse_rights_value(value: str) -> dict:
+    url_pattern = re.compile(r"^\s*([^（(]+?)\s*[（(]\s*(https?://[^）)]+)\s*[）)]\s*$")
+    url_match = url_pattern.match(value.strip())
+    if url_match:
+        date_text = url_match.group(1).strip()
+        url = url_match.group(2).strip()
+    else:
+        date_text = value.strip()
+        url = None
+
+    iso_date = _parse_date_text(date_text) or date_text
+    return {
+        "date": iso_date,
+        "date_text": date_text,
+        "source_url": url,
+        "display": value.strip(),
+    }
+
+
+def _extract_event_dates_new_format(content: str) -> Optional[dict]:
+    parts = [p.strip() for p in content.split(",") if p.strip()]
+    if len(parts) < 5:
+        return None
+
+    quarter_dates: Dict[str, str] = {}
+    quarter_events: Dict[str, dict] = {}
+    for label, value in zip(QUARTER_LABELS, parts[:4]):
+        parsed = _parse_quarter_value(value)
+        if parsed is None:
+            return None
+        quarter_events[label] = parsed
+        quarter_dates[label] = parsed["display"]
+
+    rights_raw = parts[4]
+    if rights_raw.lower() == "情報未取得":
+        rights_event = None
+        rights_date = None
+    else:
+        rights_event = _parse_rights_value(rights_raw)
+        rights_date = rights_event["date"]
+
+    return {
+        "quarter_dates": quarter_dates,
+        "quarter_events": quarter_events,
+        "rights_date": rights_date,
+        "rights_event": rights_event,
+    }
+
+
+def _extract_event_dates_legacy(content: str) -> dict:
+    quarter_dates: Dict[str, str] = {}
+    rights_date = None
 
     parts = [p.strip() for p in content.split(",") if p.strip()]
     if len(parts) >= 5:
-        for label, value in zip(quarter_labels, parts[:4]):
+        for label, value in zip(QUARTER_LABELS, parts[:4]):
             quarter_dates[label] = value
         rights_date = parts[4]
-        return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+        return {
+            "quarter_dates": quarter_dates,
+            "quarter_events": {},
+            "rights_date": rights_date,
+            "rights_event": None,
+        }
 
     try:
         parsed = json.loads(content)
         quarter_dates = parsed.get("quarter_dates") or {}
         rights_date = parsed.get("rights_date")
-        return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+        return {
+            "quarter_dates": quarter_dates,
+            "quarter_events": {},
+            "rights_date": rights_date,
+            "rights_event": None,
+        }
     except Exception:
         pass
 
-    for label in quarter_labels:
+    for label in QUARTER_LABELS:
         extracted = _extract_date_after_label(content, f"{label}決算")
         if extracted:
             quarter_dates[label] = extracted
@@ -167,4 +244,25 @@ def _extract_event_dates(content: str):
         if match:
             rights_date = match.group(1)
 
-    return {"quarter_dates": quarter_dates, "rights_date": rights_date}
+    return {
+        "quarter_dates": quarter_dates,
+        "quarter_events": {},
+        "rights_date": rights_date,
+        "rights_event": None,
+    }
+
+
+def _extract_event_dates(content: str):
+    content = (content or "").strip()
+    if not content:
+        return {
+            "quarter_dates": {},
+            "quarter_events": {},
+            "rights_date": None,
+            "rights_event": None,
+        }
+
+    parsed = _extract_event_dates_new_format(content)
+    if parsed:
+        return parsed
+    return _extract_event_dates_legacy(content)

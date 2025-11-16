@@ -35,7 +35,7 @@ def _save_cache(cache: Dict[str, dict]) -> None:
 
 
 def get_cached_events(code: str, max_age_days: int = MAX_CACHE_AGE_DAYS) -> Optional[dict]:
-    """指定コードのキャッシュを取得。一定期間を超えていれば None を返す。"""
+    """キャッシュされたイベント情報を取り出し、期限切れなら None を返す。"""
     normalized = _normalize_code(code)
     cache = _load_cache()
     entry = cache.get(normalized)
@@ -51,7 +51,6 @@ def get_cached_events(code: str, max_age_days: int = MAX_CACHE_AGE_DAYS) -> Opti
     except ValueError:
         return None
 
-    # UTC を想定。タイムゾーン情報がなければ UTC とみなす。
     if updated_dt.tzinfo is None:
         updated_dt = updated_dt.replace(tzinfo=timezone.utc)
 
@@ -59,6 +58,8 @@ def get_cached_events(code: str, max_age_days: int = MAX_CACHE_AGE_DAYS) -> Opti
         return None
 
     result = dict(entry)
+    result.setdefault("quarter_events", {})
+    result.setdefault("rights_event", None)
     result["from_cache"] = True
     return result
 
@@ -70,7 +71,9 @@ def set_cached_events(code: str, events: dict) -> dict:
 
     payload = {
         "quarter_dates": events.get("quarter_dates") or {},
+        "quarter_events": events.get("quarter_events") or {},
         "rights_date": events.get("rights_date"),
+        "rights_event": events.get("rights_event"),
         "raw_response": events.get("raw_response"),
         "error": events.get("error"),
         "last_updated": datetime.now(timezone.utc).isoformat(),

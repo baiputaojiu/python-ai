@@ -1,9 +1,9 @@
 """
 ファイル名: events_openai.py
 目的     : OpenAI API とキャッシュを組み合わせて決算予定日・権利付き最終日を取得する
-概要     : OpenAI への単体／複数問合せ・レスポンス解析・ローカルキャッシュへの保存/読込を担当
-入力     : 銘柄コード、取得モード（キャッシュのみ・混在・常にAI）
-出力     : quarter_dates / rights_date / raw_response / error / last_updated などを含む辞書
+概要     : OpenAI への単体／複数問い合わせとレスポンス解析、ローカルキャッシュの保存・読み出しを担当する
+入力     : 銘柄コード、取得モード（キャッシュのみ・キャッシュ優先・常にAI）
+出力     : quarter_dates / quarter_events / rights_date / rights_event / raw_response 等を含む辞書
 """
 
 from __future__ import annotations
@@ -30,9 +30,13 @@ RECENT_CACHE_DAYS = 31  # 約1か月
 def _format_openai_missing() -> dict:
     return {
         "quarter_dates": {},
+        "quarter_events": {},
         "rights_date": None,
+        "rights_event": None,
         "raw_response": None,
         "error": "OpenAI API unavailable",
+        "last_updated": None,
+        "from_cache": False,
     }
 
 
@@ -53,7 +57,9 @@ def _collect_text_content(message_content) -> str:
 def _finalize_result(data: dict, *, from_cache: bool) -> dict:
     return {
         "quarter_dates": data.get("quarter_dates") or {},
+        "quarter_events": data.get("quarter_events") or {},
         "rights_date": data.get("rights_date"),
+        "rights_event": data.get("rights_event"),
         "raw_response": data.get("raw_response"),
         "error": data.get("error"),
         "last_updated": data.get("last_updated"),
@@ -64,7 +70,9 @@ def _finalize_result(data: dict, *, from_cache: bool) -> dict:
 def _empty_cache_result(message: str) -> dict:
     return {
         "quarter_dates": {},
+        "quarter_events": {},
         "rights_date": None,
+        "rights_event": None,
         "raw_response": None,
         "error": message,
         "last_updated": None,
@@ -81,14 +89,25 @@ def get_events_by_openai(code: str) -> dict:
     prompt = textwrap.dedent(
         f"""
         日本株 {code} について、最新または最も確からしい決算発表予定と権利付き最終日を信頼できる日本語ソースや過去実績から推定して調べてください。
-        回答は「第1四半期・第2四半期・第3四半期・通期・権利付き最終日」を順番に、半角カンマ区切りで 5 つの日付文字列のみを返してください。
-        例: 2025年8月上旬,2025年11月上旬,2026年2月上旬,2026年5月上旬,2026-03-27
-        厳密な日付が不明でも、「2025年8月上旬」「2026年2月中旬」のように幅を持たせた表現を必ず記載してください。
-        情報が全く得られない場合のみ「情報未取得」と記載してください。それ以外の表や JSON や説明を一切出力しないでください。
+        各四半期については、次回の決算発表予定日が分かる場合はその日付を、分からない場合は前回の決算発表日を用いてください。
+        回答は「第1四半期・第2四半期・第3四半期・通期・権利付き最終日」を順番に、半角カンマ区切りで 5 個の要素のみを1行で返してください。
+        先頭4つの要素は、必ず「2025年8月12日（予定｜https://example.com/ir1）」または「2025年8月12日（前回｜https://example.com/ir2）」のように、
+        「日付（予定または前回｜出典URL）」という形式で出力してください。URL は日本語以外で、直前直後に空白を入れないでください。
+        最後の要素（権利付き最終日）も同様に、「2026年3月27日（予定｜https://example.com/ir5）」または「2026年3月27日（前回｜https://example.com/ir6）」のように、
+        「日付（予定または前回｜出典URL）」という形式で出力してください。権利付き最終日のみ日付だけ、となる形式は使用しないでください。
+        例: 2025年8月12日（前回｜https://example.com/ir1）,2025年11月11日（前回｜https://example.com/ir2）,2026年2月4日（予定｜https://example.com/ir3）,2026年5月14日（予定｜https://example.com/ir4）,2026年3月27日（予定｜https://example.com/ir5）
+        情報が全く得られない場合のみ「情報未取得」と 1 語だけ出力してください。それ以外の表・JSON・説明文・改行を一切出力しないでください。
         """
     ).strip()
 
-    result = {"quarter_dates": {}, "rights_date": None, "raw_response": None, "error": None}
+    result = {
+        "quarter_dates": {},
+        "quarter_events": {},
+        "rights_date": None,
+        "rights_event": None,
+        "raw_response": None,
+        "error": None,
+    }
     try:
         response = client.chat.completions.create(
             model="gpt-4o-search-preview",
@@ -120,7 +139,9 @@ def get_events_by_openai(code: str) -> dict:
             result["raw_response"] = content
             extracted = _extract_event_dates(content)
             result["quarter_dates"] = extracted.get("quarter_dates") or {}
+            result["quarter_events"] = extracted.get("quarter_events") or {}
             result["rights_date"] = extracted.get("rights_date")
+            result["rights_event"] = extracted.get("rights_event")
     except Exception as exc:  # pragma: no cover - API 呼び出しエラー
         result["error"] = str(exc)
 
@@ -137,11 +158,15 @@ def get_events_by_openai_batch(codes: List[str]) -> Dict[str, dict]:
     prompt = textwrap.dedent(
         f"""
         以下の日本株コードそれぞれについて、最新または最も確からしい決算発表予定と権利付き最終日を信頼できる日本語ソースや過去実績から推定して調べてください。
-        各コードの回答は「第1四半期・第2四半期・第3四半期・通期・権利付き最終日」の順で日付を必ず示し、厳密な日付が不明でも「2025年8月上旬」「2026年2月中旬」のように幅を持たせた表現を記載してください。
-        情報が全く得られない場合のみ「情報未取得」と記載してください。それ以外の表や JSON や説明を一切出力しないでください。
+        各コードの回答は「第1四半期・第2四半期・第3四半期・通期・権利付き最終日」の順に、半角カンマ区切りで 5 個の要素だけを 1 行で出力してください。
+        先頭4つの値は必ず「2025年8月12日（予定｜https://example.com/ir1）」または「2025年8月12日（前回｜https://example.com/ir2）」のように
+        「日付（予定または前回｜出典URL）」という形式で出力してください。URL の前後に余分な空白を入れないでください。
+        最後の値（権利付き最終日）も、必ず「2026年3月27日（予定｜https://example.com/ir5）」または「2026年3月27日（前回｜https://example.com/ir6）」のように、
+        「日付（予定または前回｜出典URL）」という形式で出力してください。
+        情報が全く得られない場合のみ「情報未取得」と記載してください。それ以外の表・JSON・説明文・改行を一切出力しないでください。
 
         出力形式: 1 行につき銘柄のみ
-        7203: 2025年8月上旬,2025年11月上旬,2026年2月上旬,2026年5月上旬,2026-03-27
+        7203: 2025年8月12日（前回｜https://example.com/ir1）,2025年11月11日（前回｜https://example.com/ir2）,2026年2月4日（予定｜https://example.com/ir3）,2026年5月14日（予定｜https://example.com/ir4）,2026年3月27日（予定｜https://example.com/ir5）
         6758: ...
 
         対象コード:
@@ -174,7 +199,9 @@ def get_events_by_openai_batch(codes: List[str]) -> Dict[str, dict]:
         return {
             code: {
                 "quarter_dates": {},
+                "quarter_events": {},
                 "rights_date": None,
+                "rights_event": None,
                 "raw_response": None,
                 "error": str(exc),
             }
@@ -187,18 +214,21 @@ def get_events_by_openai_batch(codes: List[str]) -> Dict[str, dict]:
         return {
             code: {
                 "quarter_dates": {},
+                "quarter_events": {},
                 "rights_date": None,
+                "rights_event": None,
                 "raw_response": raw_response,
                 "error": "OpenAI response contained no text content.",
             }
             for code in codes
         }
 
-    quarter_labels = ["第1四半期", "第2四半期", "第3四半期", "通期"]
     results = {
         code: {
             "quarter_dates": {},
+            "quarter_events": {},
             "rights_date": None,
+            "rights_event": None,
             "raw_response": raw_response,
             "error": f"{code} のデータを読み取れませんでした。",
         }
@@ -219,12 +249,12 @@ def get_events_by_openai_batch(codes: List[str]) -> Dict[str, dict]:
             results[code_part]["error"] = f"{code_part} の値が不足しています。"
             continue
 
-        quarter_dates = {label: value for label, value in zip(quarter_labels, values[:4])}
-        rights_date = values[4]
-
+        extracted = _extract_event_dates(",".join(values[:5]))
         results[code_part] = {
-            "quarter_dates": quarter_dates,
-            "rights_date": rights_date,
+            "quarter_dates": extracted.get("quarter_dates") or {},
+            "quarter_events": extracted.get("quarter_events") or {},
+            "rights_date": extracted.get("rights_date"),
+            "rights_event": extracted.get("rights_event"),
             "raw_response": raw_response,
             "error": None,
         }
@@ -241,14 +271,14 @@ def _fetch_via_ai(codes: List[str]) -> Dict[str, dict]:
         code = codes[0]
         ai_result = get_events_by_openai(code)
         stored = set_cached_events(code, ai_result)
-        return {code: _finalize_result(stored, from_cache=False)}
+        return {_normalize_code(code): _finalize_result(stored, from_cache=False)}
 
     batch_results = get_events_by_openai_batch(codes)
     final_results: Dict[str, dict] = {}
     for code in codes:
         ai_result = batch_results.get(code) or _format_openai_missing()
         stored = set_cached_events(code, ai_result)
-        final_results[code] = _finalize_result(stored, from_cache=False)
+        final_results[_normalize_code(code)] = _finalize_result(stored, from_cache=False)
     return final_results
 
 
