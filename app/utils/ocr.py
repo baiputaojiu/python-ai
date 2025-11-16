@@ -1,13 +1,14 @@
 """
 ファイル名: ocr.py
-目的     : アップロードされた画像からテキストを抽出する
-概要     : Streamlit のアップロードファイルを PIL で開き、pytesseract で OCR を実行する
+目的     : 画像からテキストを抽出する
+概要     : Streamlit のアップロード画像を PIL で読み込み、pytesseract もしくは OpenAI Vision で OCR を行う
 入力     : uploaded_file: Streamlit の UploadedFile オブジェクト
-出力     : str: OCR で検出したテキスト
+出力     : str: OCR で得られたテキスト
 """
 
 import io
 import os
+from typing import Dict
 
 import pytesseract
 from PIL import Image
@@ -19,9 +20,8 @@ except ImportError:  # pragma: no cover
 
 BACKEND_TESSERACT = "tesseract"
 BACKEND_OPENAI = "openai_vision"
+BACKEND_AUTO = "auto"
 BACKEND_NONE = "none"
-
-ENABLE_VISION = os.getenv("ENABLE_VISION_OCR", "").lower() in {"1", "true", "yes"}
 
 
 def _has_tesseract() -> bool:
@@ -33,7 +33,14 @@ def _has_tesseract() -> bool:
 
 
 def _has_openai() -> bool:
-    return ENABLE_VISION and OpenAI is not None and bool(os.getenv("OPENAI_API_KEY"))
+    return OpenAI is not None and bool(os.getenv("OPENAI_API_KEY"))
+
+
+def get_available_ocr_backends() -> Dict[str, bool]:
+    return {
+        BACKEND_TESSERACT: _has_tesseract(),
+        BACKEND_OPENAI: _has_openai(),
+    }
 
 
 def _detect_backend() -> str:
@@ -44,15 +51,22 @@ def _detect_backend() -> str:
     return BACKEND_NONE
 
 
-OCR_BACKEND = _detect_backend()
-
-
-def extract_text_from_image(uploaded_file) -> str:
+def extract_text_from_image(uploaded_file, backend: str | None = None) -> str:
     """アップロードされた画像から OCR でテキストを抽出する。"""
-    if OCR_BACKEND == BACKEND_TESSERACT:
+    selected_backend = backend or BACKEND_AUTO
+    if selected_backend == BACKEND_AUTO:
+        selected_backend = _detect_backend()
+
+    if selected_backend == BACKEND_TESSERACT:
+        if not _has_tesseract():
+            raise RuntimeError("Tesseract OCR が利用できません。")
         return _extract_with_tesseract(uploaded_file)
-    if OCR_BACKEND == BACKEND_OPENAI:
+
+    if selected_backend == BACKEND_OPENAI:
+        if not _has_openai():
+            raise RuntimeError("OpenAI Vision OCR が利用できません。")
         return _extract_with_openai(uploaded_file)
+
     raise RuntimeError("この環境ではOCR機能が利用できません。")
 
 
@@ -68,6 +82,8 @@ def _extract_with_tesseract(uploaded_file) -> str:
 def _extract_with_openai(uploaded_file) -> str:
     if OpenAI is None:
         raise RuntimeError("OpenAIライブラリが利用できません。")
+    # NOTE: 現状は Chat Completions API で Vision OCR を実行している。
+    # OpenAI の Responses API でも同様の処理は可能で、ケースによっては料金が安くなる場合がある。
 
     client = OpenAI()
     uploaded_file.seek(0)
@@ -79,32 +95,42 @@ def _extract_with_openai(uploaded_file) -> str:
     uploaded_file.seek(0)
 
     prompt = (
-        "画像に含まれる日本語テキストをそのまま抽出してください。"
-        "説明を加えず、検出したテキストのみをそのまま返してください。"
+        "画像に写っているすべてのテキストを、画面の上から順に抜き出してください。"
+        "日本語だけでなく、数字やアルファベット・記号も必ず含めてください。"
+        "特に銘柄名の下に表示されている銘柄コード（4桁の数字や英数字）は絶対に省略しないでください。"
+        "改行や区切りは画面の並びに従い、説明や要約は書かず、検出したテキストだけをそのまま返してください。"
     )
 
-    response = client.responses.create(
+    import base64
+
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:image/png;base64,{b64_image}"
+
+    response = client.chat.completions.create(
         model=os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini"),
-        input=[
+        messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_bytes": image_bytes,
-                    },
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
         ],
     )
 
-    output_text = []
-    for choice in response.output:
-        if choice.type == "message":
-            for segment in choice.message.content:
-                if segment.type == "output_text":
-                    output_text.append(segment.text)
-    if not output_text:
+    message_content = response.choices[0].message.content
+    if isinstance(message_content, list):
+        parts = []
+        for block in message_content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        text = "".join(parts).strip()
+    else:
+        text = (message_content or "").strip()
+
+    if not text:
         raise RuntimeError("OpenAI Visionの出力を取得できませんでした。")
-    return "\n".join(output_text).strip()
+    return text

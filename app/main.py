@@ -19,7 +19,13 @@ from app.services.events_openai import (
 from app.services.stock_fetch import fetch_stock_info
 from app.ui.results import display_stock_results
 from app.utils.code_detect import extract_stock_codes_from_text
-from app.utils.ocr import extract_text_from_image
+from app.utils.ocr import (
+    BACKEND_AUTO,
+    BACKEND_OPENAI,
+    BACKEND_TESSERACT,
+    extract_text_from_image,
+    get_available_ocr_backends,
+)
 from app.utils.stock_search import search_stock_code
 
 _configure_matplotlib_font()
@@ -98,7 +104,7 @@ def run():
         ("常にAI検索してキャッシュも更新", ALWAYS_AI_MODE),
     ]
     mode_labels = [label for label, _ in mode_items]
-    selected_label = st.selectbox("決算予定日・権利付き最終日の取得方法", mode_labels, index=1)
+    selected_label = st.selectbox("決算予定日・権利付き最終日の取得方法", mode_labels, index=0)
     event_mode = dict(mode_items)[selected_label]
     show_events = manual_show_events or (event_mode != CACHE_ONLY_MODE)
 
@@ -112,13 +118,37 @@ def run():
     keyword = keyword_input
 
     uploaded_image = st.file_uploader("画像をアップロード", type=["png", "jpg", "jpeg"])
-    from app.utils.ocr import OCR_BACKEND, BACKEND_TESSERACT, BACKEND_OPENAI
+    backend_availability = get_available_ocr_backends()
+    ocr_options = [
+        ("自動（利用可能なエンジンを優先）", BACKEND_AUTO),
+        (
+            f"Tesseract を利用する"
+            + ("（利用不可）" if not backend_availability.get(BACKEND_TESSERACT) else "（ローカルOCR）"),
+            BACKEND_TESSERACT,
+        ),
+        (
+            f"OpenAI Vision を利用する"
+            + (
+                "（利用不可）"
+                if not backend_availability.get(BACKEND_OPENAI)
+                else "（クラウドOCR・OpenAI APIの料金が発生します）"
+            ),
+            BACKEND_OPENAI,
+        ),
+    ]
 
-    backend_label = {
-        BACKEND_TESSERACT: "Tesseract",
-        BACKEND_OPENAI: "OpenAI Vision",
-    }.get(OCR_BACKEND, "利用不可")
-    st.caption(f"OCRエンジン: {backend_label}")
+    selected_label = st.selectbox(
+        "OCRエンジンを選択",
+        [label for label, _ in ocr_options],
+    )
+    selected_ocr_backend = dict(ocr_options)[selected_label]
+
+    if not backend_availability.get(BACKEND_TESSERACT):
+        st.caption("Tesseract が利用できない環境です。")
+    if backend_availability.get(BACKEND_OPENAI):
+        st.caption("OpenAI Vision は OpenAI API の利用料金が発生します。APIキーを安全に管理した環境でのみご利用ください。")
+    else:
+        st.caption("OpenAI Vision を利用するには OPENAI_API_KEY を設定してください。")
 
     ocr_text = ""
     ocr_codes = []
@@ -126,7 +156,9 @@ def run():
     ocr_result_cache = {}
     if uploaded_image is not None:
         try:
-            ocr_text = extract_text_from_image(uploaded_file=uploaded_image)
+            ocr_text = extract_text_from_image(
+                uploaded_file=uploaded_image, backend=selected_ocr_backend
+            )
             st.text_area("OCR結果", value=ocr_text or "※ テキストが検出されませんでした ※", height=200)
             ocr_codes = extract_stock_codes_from_text(ocr_text)
             if ocr_codes:
