@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from io import BytesIO
 import requests
+import pytesseract
+from PIL import Image
 
 try:
     from openai import OpenAI
@@ -37,6 +39,48 @@ def _configure_matplotlib_font():
 
 
 _configure_matplotlib_font()
+
+
+def _configure_tesseract_command():
+    """
+    pytesseractの実行パスを環境変数またはWindows標準のパスから解決する。
+    """
+    candidate_paths = [
+        os.getenv("TESSERACT_CMD"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    ]
+    for path in candidate_paths:
+        if path and os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            break
+
+
+_configure_tesseract_command()
+
+
+# ----------------------------------------
+# 表示名補正
+# ----------------------------------------
+def _prefer_japanese_name(info: dict) -> str:
+    if not isinstance(info, dict):
+        return "N/A"
+
+    candidates = [
+        info.get("shortName"),
+        info.get("longName"),
+        info.get("displayName"),
+        info.get("name"),
+    ]
+
+    for candidate in candidates:
+        if candidate and re.search(r"[ぁ-んァ-ン一-龥]", candidate):
+            return candidate
+
+    for candidate in candidates:
+        if candidate:
+            return candidate
+
+    return "N/A"
 
 
 # ----------------------------------------
@@ -97,7 +141,7 @@ def fetch_stock_info(code: str, period: str = "1mo"):
     # 銘柄名
     try:
         info = ticker.get_info()
-        name = info.get("shortName", "N/A")
+        name = _prefer_japanese_name(info)
     except Exception:
         name = "N/A"
 
@@ -282,6 +326,46 @@ def _normalize_code(code: str) -> str:
     if normalized.isdigit():
         normalized = normalized.zfill(4)
     return normalized
+
+
+STOCK_CODE_PATTERN = re.compile(r"\b(?:\d{4}|[0-9A-Z]{4})\b")
+LOOSE_STOCK_CODE_PATTERN = re.compile(r"(?:\d{4}|[0-9A-Z]{4})")
+
+
+def extract_text_from_image(uploaded_file) -> str:
+    """
+    StreamlitのアップロードデータからOCR文字列を抽出する。
+    """
+    uploaded_file.seek(0)
+    image = Image.open(uploaded_file)
+    image = image.convert("RGB")
+    text = pytesseract.image_to_string(image, lang="jpn")
+    uploaded_file.seek(0)
+    return text.strip()
+
+
+def extract_stock_codes_from_text(text: str):
+    """
+    OCRテキストから銘柄コードやETFコードを抽出する。
+    """
+    if not text:
+        return []
+
+    uppercase_text = text.upper()
+    cleaned_text = re.sub(r"[\s\u3000]", "", uppercase_text)
+
+    candidates = list(STOCK_CODE_PATTERN.findall(uppercase_text))
+    if cleaned_text:
+        candidates.extend(LOOSE_STOCK_CODE_PATTERN.findall(cleaned_text))
+
+    codes = []
+    seen = set()
+    for raw in candidates:
+        normalized = _normalize_code(raw)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            codes.append(normalized)
+    return codes
 
 
 def get_events_by_openai(code: str):
@@ -635,11 +719,60 @@ st.write("- 銘柄コード（例: 7203）")
 st.write("- 複数コード（例: 7203, 6758, 9984）")
 st.write("- 銘柄名（例: トヨタ） → 自動で検索")
 
-keyword = st.text_input("銘柄コード または 銘柄名（カンマ区切り可）")
+keyword_input = st.text_input("銘柄コード または 銘柄名（カンマ区切り可）")
+keyword = keyword_input
 
+uploaded_image = st.file_uploader("画像をアップロード", type=["png", "jpg", "jpeg"])
+ocr_text = ""
+ocr_codes = []
+ocr_valid_codes = []
+ocr_result_cache = {}
+if uploaded_image is not None:
+    try:
+        ocr_text = extract_text_from_image(uploaded_image)
+        st.text_area("OCR結果", value=ocr_text or "（テキストが検出されませんでした）", height=200)
+        ocr_codes = extract_stock_codes_from_text(ocr_text)
+        if ocr_codes:
+            st.success(f"OCRで抽出された銘柄コード候補: {', '.join(ocr_codes)}")
 
-def render_stock_panel(code: str, events_cache=None):
-    result = fetch_stock_info(code, period=period)
+            skipped_from_ocr = []
+            with st.spinner("OCRで検出した銘柄コードから株価データ取得可否を確認しています..."):
+                for code in ocr_codes:
+                    result = fetch_stock_info(code, period=period)
+                    if result is None:
+                        skipped_from_ocr.append(code)
+                        continue
+
+                    normalized_code = result["code"]
+                    if normalized_code in ocr_result_cache:
+                        continue
+
+                    ocr_valid_codes.append(normalized_code)
+                    ocr_result_cache[normalized_code] = result
+
+            if ocr_valid_codes:
+                table_rows = [
+                    {"コード": code, "銘柄名": ocr_result_cache[code]["name"]}
+                    for code in ocr_valid_codes
+                ]
+                st.write("🔎 OCRで株価データ取得が確認できた銘柄一覧")
+                st.table(pd.DataFrame(table_rows))
+                st.info("上記の銘柄について株価を取得するには、下の「株価を取得」ボタンを押してください。")
+            else:
+                st.warning("OCRで読み取った銘柄から有効な株価データが得られませんでした。")
+
+            if skipped_from_ocr:
+                st.warning(
+                    "以下のコードは株価データを取得できなかったため除外しました: "
+                    + ", ".join(skipped_from_ocr)
+                )
+        else:
+            st.warning("OCRで銘柄コードを検出できませんでした。")
+    except Exception as ocr_exc:
+        st.error(f"OCR処理中にエラーが発生しました: {ocr_exc}")
+
+def render_stock_panel(code: str, events_cache=None, preloaded_result=None):
+    result = preloaded_result or fetch_stock_info(code, period=period)
 
     if result is None:
         st.error(f"[{code}] の株価データを取得できませんでした。")
@@ -722,46 +855,99 @@ def render_stock_panel(code: str, events_cache=None):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-if st.button("株価を取得"):
-    if not keyword.strip():
-        st.warning("銘柄コードまたは銘柄名を入力してください。")
-        st.stop()
+def display_stock_results(codes, spinner_label=None, preloaded_results=None):
+    unique_codes = []
+    seen = set()
+    for code in codes:
+        cleaned = code.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        unique_codes.append(cleaned)
 
-    keyword = keyword.strip()
-    codes = []
-
-    if "," in keyword:
-        codes = [c.strip() for c in keyword.split(",") if c.strip()]
-    elif keyword.isdigit():
-        codes = [keyword]
-    else:
-        matches = search_stock_code(keyword)
-        if not matches:
-            st.error("該当する銘柄が見つかりませんでした。")
-            st.stop()
-
-        st.write("🔍 一致した候補:")
-        for code, name in matches:
-            st.write(f"- {code} : {name}")
-
-        first_code, first_name = matches[0]
-        st.info(f"最初の候補 {first_code} : {first_name} を使用します。")
-        codes = [first_code]
-
-    if not codes:
+    if not unique_codes:
         st.warning("表示する銘柄がありません。")
-        st.stop()
+        return
+
+    preloaded_results = preloaded_results or {}
+    valid_codes = []
+    result_cache = {}
+    skipped_codes = []
+    for code in unique_codes:
+        preloaded = preloaded_results.get(code)
+        if preloaded is not None:
+            result = preloaded
+        else:
+            result = fetch_stock_info(code, period=period)
+
+        if result is None:
+            skipped_codes.append(code)
+            continue
+        valid_codes.append(code)
+        result_cache[code] = result
+
+    if skipped_codes:
+        st.warning(
+            f"株価データを取得できなかったためスキップしたコード: {', '.join(skipped_codes)}"
+        )
+
+    if not valid_codes:
+        st.warning("有効な銘柄コードがありませんでした。")
+        return
 
     events_cache = {}
     if show_events:
-        with st.spinner("選択した銘柄の決算予定日 (ChatGPT) をまとめて取得中..."):
-            events_cache = fetch_events_info_for_codes(codes)
+        message = spinner_label or "選択した銘柄の決算予定日 (ChatGPT) をまとめて取得中..."
+        with st.spinner(message):
+            events_cache = fetch_events_info_for_codes(valid_codes)
 
-    cols_per_row = min(3, len(codes)) if len(codes) > 1 else 1
-
-    for i in range(0, len(codes), cols_per_row):
-        row_codes = codes[i:i + cols_per_row]
+    cols_per_row = min(3, len(valid_codes)) if len(valid_codes) > 1 else 1
+    for i in range(0, len(valid_codes), cols_per_row):
+        row_codes = valid_codes[i:i + cols_per_row]
         columns = st.columns(len(row_codes))
         for column, code in zip(columns, row_codes):
             with column:
-                render_stock_panel(code, events_cache=events_cache if show_events else None)
+                render_stock_panel(
+                    code,
+                    events_cache=events_cache if show_events else None,
+                    preloaded_result=result_cache.get(code),
+                )
+if st.button("株価を取得"):
+    codes = []
+    preloaded = None
+    spinner_message = None
+
+    if ocr_valid_codes:
+        codes = ocr_valid_codes
+        preloaded = ocr_result_cache
+        spinner_message = "OCRで抽出した銘柄の決算予定日 (ChatGPT) をまとめて取得中..."
+    else:
+        if not keyword.strip():
+            st.warning("銘柄コードまたは銘柄名を入力してください。")
+            st.stop()
+
+        keyword = keyword.strip()
+
+        if "," in keyword:
+            codes = [c.strip() for c in keyword.split(",") if c.strip()]
+        elif keyword.isdigit():
+            codes = [keyword]
+        else:
+            matches = search_stock_code(keyword)
+            if not matches:
+                st.error("該当する銘柄が見つかりませんでした。")
+                st.stop()
+
+            st.write("🔍 一致した候補:")
+            for code, name in matches:
+                st.write(f"- {code} : {name}")
+
+            first_code, first_name = matches[0]
+            st.info(f"最初の候補 {first_code} : {first_name} を使用します。")
+            codes = [first_code]
+
+    display_stock_results(
+        codes,
+        spinner_label=spinner_message,
+        preloaded_results=preloaded,
+    )
