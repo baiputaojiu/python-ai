@@ -1,16 +1,17 @@
-"""
+﻿"""
 ファイル名: panel.py
 目的     : 単一銘柄の情報パネルを描画する
 概要     : 株価メトリクス・チャート・決算イベント情報の表示をまとめて行う
-入力     : code(str), period/label 情報、イベントキャッシュ等
+入力     : code(str), period(str), period_label(str), header_period(str), show_events(bool), event_mode(str)
 出力     : なし（Streamlit へ描画）
 """
 
 import streamlit as st
 
 from app.charts.candlestick import create_candlestick_image
-from app.services.events_openai import get_events_info
+from app.services.events_openai import CACHE_ONLY_MODE, get_events_info
 from app.services.stock_fetch import fetch_stock_info
+from app.utils.yahoo_links import get_forum_url
 
 
 def render_stock_panel(
@@ -19,6 +20,7 @@ def render_stock_panel(
     period_label: str,
     header_period: str,
     show_events: bool,
+    event_mode: str,
     events_cache=None,
     preloaded_result=None,
 ):
@@ -32,11 +34,9 @@ def render_stock_panel(
     st.markdown("<div class='stock-card'>", unsafe_allow_html=True)
     st.markdown(f"### {result['code']} | {result['name']}  (Period: {header_period})")
 
-    # Yahoo!ファイナンスの掲示板（銘柄ページ）へのリンクを表示する。
-    # 掲示板タブへはリンク先ページ内から遷移できるため、スクレイピングをせずに要望を満たせる。
-    yahoo_quote_url = f"https://finance.yahoo.co.jp/quote/{result['code']}.T/forum"
+    forum_url = get_forum_url(result["code"])
     st.markdown(
-        f"[Yahoo!ファイナンスの掲示板を開く]({yahoo_quote_url})",
+        f"[Yahoo!ファイナンスの掲示板を開く]({forum_url})",
         unsafe_allow_html=False,
     )
 
@@ -65,7 +65,7 @@ def render_stock_panel(
                 result["data"], f"{result['code']} {result['name']} ({period_label})"
             )
             st.image(img, width="stretch")
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - UIのみ
             st.error(f"チャート生成に失敗しました: {e}")
             st.markdown("</div>", unsafe_allow_html=True)
             return
@@ -79,34 +79,41 @@ def render_stock_panel(
         )
 
     with content_cols[1]:
-        if show_events:
-            events = None
-            if events_cache:
-                events = events_cache.get(result["code"])
+        events = None
+        if events_cache:
+            events = events_cache.get(result["code"])
 
-            if events is None:
-                with st.spinner("決算予定日と権利付き最終日を取得中..."):
-                    events = get_events_info(result["code"])
+        if events is None:
+            fallback_mode = event_mode if show_events else CACHE_ONLY_MODE
+            events = get_events_info(result["code"], mode=fallback_mode)
 
-            quarter_dates = events.get("quarter_dates") or {}
-            rights_event = events.get("rights_date")
-            raw_response = events.get("raw_response")
-            error_message = events.get("error")
+        quarter_dates = events.get("quarter_dates") or {}
+        rights_event = events.get("rights_date")
+        raw_response = events.get("raw_response")
+        error_message = events.get("error")
+        last_updated = events.get("last_updated")
+        source_label = "キャッシュ" if events.get("from_cache") else "AI検索"
 
-            st.markdown("### 📅 決算予定日 (ChatGPT)")
-            order = ["第1四半期", "第2四半期", "第3四半期", "通期"]
-            for label in order:
-                value = quarter_dates.get(label) or "情報なし"
-                st.write(f"{label}: {value}")
+        st.markdown("### 📅 決算予定日")
+        order = ["第1四半期", "第2四半期", "第3四半期", "通期"]
+        for label in order:
+            value = quarter_dates.get(label) or "情報なし"
+            st.write(f"{label}: {value}")
 
-            st.markdown("### 🎯 権利付き最終日 (ChatGPT)")
-            st.write(rights_event or "情報なし")
+        st.markdown("### 🎯 権利付き最終日")
+        st.write(rights_event or "情報なし")
 
-            with st.expander("GPTレスポンス（デバッグ用途）"):
-                if error_message:
-                    st.write(f"エラー: {error_message}")
-                st.code(raw_response or "レスポンスなし", language="json")
+        if last_updated:
+            st.caption(f"最終更新日: {last_updated}（{source_label}）")
         else:
-            st.caption("決算予定日・権利付き最終日の取得は現在オフになっています。")
+            st.caption(f"最終更新日: --（{source_label}）")
+
+        if not events.get("quarter_dates") and not events.get("rights_date"):
+            st.info("キャッシュされた情報が無い場合は、AI検索をオンにして最新情報を取得してください。")
+
+        with st.expander("GPTレスポンス（デバッグ用途）"):
+            if error_message:
+                st.write(f"エラー: {error_message}")
+            st.code(raw_response or "レスポンスなし", language="json")
 
     st.markdown("</div>", unsafe_allow_html=True)

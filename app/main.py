@@ -11,6 +11,11 @@ import streamlit as st
 
 from app.config.fonts import _configure_matplotlib_font
 from app.config.tesseract import _configure_tesseract_command
+from app.services.events_openai import (
+    ALWAYS_AI_MODE,
+    CACHE_FIRST_MODE,
+    CACHE_ONLY_MODE,
+)
 from app.services.stock_fetch import fetch_stock_info
 from app.ui.results import display_stock_results
 from app.utils.code_detect import extract_stock_codes_from_text
@@ -82,10 +87,20 @@ def run():
     header_period = period_label_short.get(period_label, period_label)
 
     st.write(f"選択中の期間: **{period_label} ({period})**")
-    show_events = st.checkbox(
+    manual_show_events = st.checkbox(
         "決算予定日・権利付き最終日も表示する（AI検索を含むためコストが発生します）",
         value=False,
     )
+
+    mode_items = [
+        ("キャッシュだけ見る", CACHE_ONLY_MODE),
+        ("1か月以内のキャッシュがあればAIスキップ、それ以外はAI検索＋キャッシュ更新", CACHE_FIRST_MODE),
+        ("常にAI検索してキャッシュも更新", ALWAYS_AI_MODE),
+    ]
+    mode_labels = [label for label, _ in mode_items]
+    selected_label = st.selectbox("決算予定日・権利付き最終日の取得方法", mode_labels, index=1)
+    event_mode = dict(mode_items)[selected_label]
+    show_events = manual_show_events or (event_mode != CACHE_ONLY_MODE)
 
     st.markdown("---")
     st.write("銘柄の入力方法")
@@ -185,6 +200,7 @@ def run():
             period_label=period_label,
             header_period=header_period,
             show_events=show_events,
+            event_mode=event_mode,
             spinner_label=spinner_message,
             preloaded_results=preloaded,
         )

@@ -1,31 +1,41 @@
-"""
+﻿"""
 ファイル名: results.py
 目的     : 複数銘柄の検索結果をまとめて表示する
-概要     : 銘柄コードの重複排除、株価データ取得、イベントのまとめ取得、パネル描画を担当
-入力     : codes(list[str]) など UI からの指定
+概要     : 銘柄コードの重複排除、株価データ取得、イベント情報・UI ボタン描画を担当
+入力     : codes(list[str]), period/label 情報, show_events(bool) など
 出力     : なし（Streamlit へ描画）
 """
 
 import json
+from typing import Dict, List, Optional
+from uuid import uuid4
+
 import streamlit as st
 from streamlit.components.v1 import html
 
-from app.services.events_openai import fetch_events_info_for_codes
+from app.services.events_openai import (
+    ALWAYS_AI_MODE,
+    CACHE_FIRST_MODE,
+    CACHE_ONLY_MODE,
+    fetch_events_info_for_codes,
+)
 from app.services.stock_fetch import fetch_stock_info
 from app.ui.panel import render_stock_panel
+from app.utils.yahoo_links import get_forum_url
 
 
 def display_stock_results(
-    codes,
-    period,
-    period_label,
-    header_period,
-    show_events,
-    spinner_label=None,
-    preloaded_results=None,
-):
+    codes: List[str],
+    period: str,
+    period_label: str,
+    header_period: str,
+    show_events: bool,
+    event_mode: str,
+    spinner_label: Optional[str] = None,
+    preloaded_results: Optional[Dict[str, dict]] = None,
+) -> None:
     """複数銘柄の株価結果を描画する。"""
-    unique_codes = []
+    unique_codes: List[str] = []
     seen = set()
     for code in codes:
         cleaned = code.strip()
@@ -39,9 +49,9 @@ def display_stock_results(
         return
 
     preloaded_results = preloaded_results or {}
-    valid_codes = []
-    result_cache = {}
-    skipped_codes = []
+    valid_codes: List[str] = []
+    result_cache: Dict[str, dict] = {}
+    skipped_codes: List[str] = []
     for code in unique_codes:
         preloaded = preloaded_results.get(code)
         if preloaded is not None:
@@ -64,14 +74,19 @@ def display_stock_results(
         st.warning("有効な銘柄コードがありませんでした。")
         return
 
-    # 全銘柄分の Yahoo!ファイナンス掲示板をまとめて開くボタン。
-    # 公式サイトを新しいタブで開くだけなので、スクレイピング等の禁止事項には抵触しない。
-    yahoo_urls = [f"https://finance.yahoo.co.jp/quote/{code}.T/forum" for code in valid_codes]
+    st.caption(
+        "ブラウザのポップアップブロックを解除していないと、掲示板タブが開かない場合があります。"
+    )
+
+    yahoo_urls = [get_forum_url(code) for code in valid_codes]
     urls_json = json.dumps(yahoo_urls)
+    function_id = uuid4().hex
     open_all_html = f"""
-    <button onclick="openAllYahooBoards()">全銘柄の掲示板を別タブで一気に開く</button>
+    <button class="open-yahoo-boards" onclick="openAllYahooBoards_{function_id}()">
+        全銘柄の掲示板を別タブで一気に開く
+    </button>
     <script>
-    function openAllYahooBoards() {{
+    function openAllYahooBoards_{function_id}() {{
         const urls = {urls_json};
         for (const url of urls) {{
             window.open(url, '_blank');
@@ -79,13 +94,17 @@ def display_stock_results(
     }}
     </script>
     """
-    html(open_all_html, height=70)
+    html(open_all_html, height=80)
 
-    events_cache = {}
+    active_mode = event_mode if show_events else CACHE_ONLY_MODE
+
     if show_events:
+        events_cache = {}
         message = spinner_label or "選択した銘柄の決算予定日 (ChatGPT) をまとめて取得中..."
         with st.spinner(message):
-            events_cache = fetch_events_info_for_codes(valid_codes)
+            events_cache = fetch_events_info_for_codes(valid_codes, active_mode)
+    else:
+        events_cache = fetch_events_info_for_codes(valid_codes, active_mode)
 
     cols_per_row = min(3, len(valid_codes)) if len(valid_codes) > 1 else 1
     for i in range(0, len(valid_codes), cols_per_row):
@@ -99,6 +118,7 @@ def display_stock_results(
                     period_label=period_label,
                     header_period=header_period,
                     show_events=show_events,
-                    events_cache=events_cache if show_events else None,
+                    event_mode=active_mode,
+                    events_cache=events_cache,
                     preloaded_result=result_cache.get(code),
                 )

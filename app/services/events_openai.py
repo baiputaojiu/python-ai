@@ -1,24 +1,33 @@
 """
 ファイル名: events_openai.py
-目的     : OpenAI API を利用して決算予定日と権利付き最終日を取得する
-概要     : 単体リクエスト・複数リクエストの双方を実装し、Streamlit UI へ辞書形式で返す
-入力     : code(str) もしくは codes(list[str])
-出力     : dict: quarter_dates / rights_date / raw_response / error を含む辞書
+目的     : OpenAI API とキャッシュを組み合わせて決算予定日・権利付き最終日を取得する
+概要     : OpenAI への単体／複数問合せ・レスポンス解析・ローカルキャッシュへの保存/読込を担当
+入力     : 銘柄コード、取得モード（キャッシュのみ・混在・常にAI）
+出力     : quarter_dates / rights_date / raw_response / error / last_updated などを含む辞書
 """
+
+from __future__ import annotations
 
 import os
 import textwrap
+from typing import Dict, List
 
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover - オプション機能
     OpenAI = None
 
+from app.storage.events_cache import get_cached_events, set_cached_events
 from app.utils.date_parse import _extract_event_dates
 from app.utils.normalize import _normalize_code
 
+CACHE_ONLY_MODE = "cache_only"
+CACHE_FIRST_MODE = "cache_first"
+ALWAYS_AI_MODE = "always_ai"
+RECENT_CACHE_DAYS = 31  # 約1か月
 
-def _format_openai_missing():
+
+def _format_openai_missing() -> dict:
     return {
         "quarter_dates": {},
         "rights_date": None,
@@ -27,7 +36,7 @@ def _format_openai_missing():
     }
 
 
-def _collect_text_content(message_content):
+def _collect_text_content(message_content) -> str:
     if isinstance(message_content, list):
         parts = []
         for block in message_content:
@@ -41,7 +50,29 @@ def _collect_text_content(message_content):
     return (message_content or "").strip()
 
 
-def get_events_by_openai(code: str):
+def _finalize_result(data: dict, *, from_cache: bool) -> dict:
+    return {
+        "quarter_dates": data.get("quarter_dates") or {},
+        "rights_date": data.get("rights_date"),
+        "raw_response": data.get("raw_response"),
+        "error": data.get("error"),
+        "last_updated": data.get("last_updated"),
+        "from_cache": from_cache,
+    }
+
+
+def _empty_cache_result(message: str) -> dict:
+    return {
+        "quarter_dates": {},
+        "rights_date": None,
+        "raw_response": None,
+        "error": message,
+        "last_updated": None,
+        "from_cache": True,
+    }
+
+
+def get_events_by_openai(code: str) -> dict:
     """1 銘柄分の決算予定日を OpenAI へ問い合わせる。"""
     if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
         return _format_openai_missing()
@@ -96,25 +127,13 @@ def get_events_by_openai(code: str):
     return result
 
 
-def get_events_by_openai_batch(codes):
+def get_events_by_openai_batch(codes: List[str]) -> Dict[str, dict]:
     """複数銘柄を一括で問い合わせし、行単位のレスポンスを解析する。"""
-    normalized_codes = []
-    seen = set()
-    for code in codes:
-        norm = _normalize_code(code)
-        if not norm or norm in seen:
-            continue
-        normalized_codes.append(norm)
-        seen.add(norm)
-
-    if not normalized_codes:
-        return {}
-
     if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
-        return {norm: _format_openai_missing() for norm in normalized_codes}
+        return {code: _format_openai_missing() for code in codes}
 
     client = OpenAI()
-    code_lines = "\n".join(f"- {c}" for c in normalized_codes)
+    code_lines = "\n".join(f"- {c}" for c in codes)
     prompt = textwrap.dedent(
         f"""
         以下の日本株コードそれぞれについて、最新または最も確からしい決算発表予定と権利付き最終日を信頼できる日本語ソースや過去実績から推定して調べてください。
@@ -153,37 +172,37 @@ def get_events_by_openai_batch(codes):
         )
     except Exception as exc:  # pragma: no cover - API 呼び出し失敗時
         return {
-            norm: {
+            code: {
                 "quarter_dates": {},
                 "rights_date": None,
                 "raw_response": None,
                 "error": str(exc),
             }
-            for norm in normalized_codes
+            for code in codes
         }
 
     raw_response = response.model_dump_json(indent=2, ensure_ascii=False)
     content = _collect_text_content(response.choices[0].message.content)
     if not content:
         return {
-            norm: {
+            code: {
                 "quarter_dates": {},
                 "rights_date": None,
                 "raw_response": raw_response,
                 "error": "OpenAI response contained no text content.",
             }
-            for norm in normalized_codes
+            for code in codes
         }
 
     quarter_labels = ["第1四半期", "第2四半期", "第3四半期", "通期"]
     results = {
-        norm: {
+        code: {
             "quarter_dates": {},
             "rights_date": None,
             "raw_response": raw_response,
-            "error": f"{norm} のデータを読み取れませんでした。",
+            "error": f"{code} のデータを読み取れませんでした。",
         }
-        for norm in normalized_codes
+        for code in codes
     }
 
     lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -207,43 +226,95 @@ def get_events_by_openai_batch(codes):
             "quarter_dates": quarter_dates,
             "rights_date": rights_date,
             "raw_response": raw_response,
-            "error": None
-            if quarter_dates or rights_date
-            else f"{code_part} のデータを読み取れませんでした。",
+            "error": None,
         }
 
     return results
 
 
-def get_events_info(code: str):
-    """単一銘柄用ヘルパー。OpenAI からの情報を正規化する。"""
+def _fetch_via_ai(codes: List[str]) -> Dict[str, dict]:
+    """指定されたコードを AI で取得してキャッシュへ保存する。"""
+    if not codes:
+        return {}
+
+    if len(codes) == 1:
+        code = codes[0]
+        ai_result = get_events_by_openai(code)
+        stored = set_cached_events(code, ai_result)
+        return {code: _finalize_result(stored, from_cache=False)}
+
+    batch_results = get_events_by_openai_batch(codes)
+    final_results: Dict[str, dict] = {}
+    for code in codes:
+        ai_result = batch_results.get(code) or _format_openai_missing()
+        stored = set_cached_events(code, ai_result)
+        final_results[code] = _finalize_result(stored, from_cache=False)
+    return final_results
+
+
+def get_events_info(code: str, mode: str, recent_days: int = RECENT_CACHE_DAYS) -> dict:
+    """モードに応じてキャッシュ/AI検索を組み合わせて情報を取得。"""
     normalized = _normalize_code(code)
-    ai_result = get_events_by_openai(normalized)
-    quarter_dates = ai_result.get("quarter_dates") or {}
-    rights_date = ai_result.get("rights_date")
+    if not normalized:
+        return _empty_cache_result("無効な銘柄コードです。")
 
-    return {
-        "quarter_dates": quarter_dates,
-        "rights_date": rights_date,
-        "raw_response": ai_result.get("raw_response"),
-        "error": ai_result.get("error"),
-    }
+    if mode == CACHE_ONLY_MODE:
+        cached = get_cached_events(normalized)
+        if cached:
+            return _finalize_result(cached, from_cache=True)
+        return _empty_cache_result("キャッシュが存在しません。")
+
+    if mode == CACHE_FIRST_MODE:
+        cached = get_cached_events(normalized, max_age_days=recent_days)
+        if cached:
+            return _finalize_result(cached, from_cache=True)
+        ai_result = get_events_by_openai(normalized)
+        stored = set_cached_events(normalized, ai_result)
+        return _finalize_result(stored, from_cache=False)
+
+    if mode == ALWAYS_AI_MODE:
+        ai_result = get_events_by_openai(normalized)
+        stored = set_cached_events(normalized, ai_result)
+        return _finalize_result(stored, from_cache=False)
+
+    return _empty_cache_result("不明な取得モードです。")
 
 
-def fetch_events_info_for_codes(codes):
-    """複数コードに対してイベント情報をまとめて返す。"""
-    normalized_codes = [_normalize_code(code) for code in codes if _normalize_code(code)]
+def fetch_events_info_for_codes(
+    codes: List[str],
+    mode: str,
+    recent_days: int = RECENT_CACHE_DAYS,
+) -> Dict[str, dict]:
+    """複数コード分のイベント情報をまとめて取得。"""
+    normalized_codes: List[str] = []
+    seen = set()
+    for code in codes:
+        norm = _normalize_code(code)
+        if not norm or norm in seen:
+            continue
+        normalized_codes.append(norm)
+        seen.add(norm)
+
     if not normalized_codes:
         return {}
 
-    if len(normalized_codes) == 1:
-        code = normalized_codes[0]
-        return {code: get_events_info(code)}
+    if mode == CACHE_ONLY_MODE:
+        return {code: get_events_info(code, CACHE_ONLY_MODE, recent_days) for code in normalized_codes}
 
-    batch_results = get_events_by_openai_batch(normalized_codes)
+    if mode == CACHE_FIRST_MODE:
+        results: Dict[str, dict] = {}
+        ai_targets: List[str] = []
+        for code in normalized_codes:
+            cached = get_cached_events(code, max_age_days=recent_days)
+            if cached:
+                results[code] = _finalize_result(cached, from_cache=True)
+            else:
+                ai_targets.append(code)
+        if ai_targets:
+            results.update(_fetch_via_ai(ai_targets))
+        return results
 
-    for code in normalized_codes:
-        if code not in batch_results:
-            batch_results[code] = get_events_info(code)
+    if mode == ALWAYS_AI_MODE:
+        return _fetch_via_ai(normalized_codes)
 
-    return batch_results
+    return {code: _empty_cache_result("不明な取得モードです。") for code in normalized_codes}
