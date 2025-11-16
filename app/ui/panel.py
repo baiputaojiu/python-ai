@@ -32,6 +32,14 @@ def render_stock_panel(
     st.markdown("<div class='stock-card'>", unsafe_allow_html=True)
     st.markdown(f"### {result['code']} | {result['name']}  (Period: {header_period})")
 
+    # Yahoo!ファイナンスの掲示板（銘柄ページ）へのリンクを表示する。
+    # 掲示板タブへはリンク先ページ内から遷移できるため、スクレイピングをせずに要望を満たせる。
+    yahoo_quote_url = f"https://finance.yahoo.co.jp/quote/{result['code']}.T/forum"
+    st.markdown(
+        f"[Yahoo!ファイナンスの掲示板を開く]({yahoo_quote_url})",
+        unsafe_allow_html=False,
+    )
+
     latest = result["latest"]
     diff = result["diff"]
     diff_percent = result["diff_percent"]

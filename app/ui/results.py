@@ -6,7 +6,9 @@
 出力     : なし（Streamlit へ描画）
 """
 
+import json
 import streamlit as st
+from streamlit.components.v1 import html
 
 from app.services.events_openai import fetch_events_info_for_codes
 from app.services.stock_fetch import fetch_stock_info
@@ -61,6 +63,23 @@ def display_stock_results(
     if not valid_codes:
         st.warning("有効な銘柄コードがありませんでした。")
         return
+
+    # 全銘柄分の Yahoo!ファイナンス掲示板をまとめて開くボタン。
+    # 公式サイトを新しいタブで開くだけなので、スクレイピング等の禁止事項には抵触しない。
+    yahoo_urls = [f"https://finance.yahoo.co.jp/quote/{code}.T/forum" for code in valid_codes]
+    urls_json = json.dumps(yahoo_urls)
+    open_all_html = f"""
+    <button onclick="openAllYahooBoards()">全銘柄の掲示板を別タブで一気に開く</button>
+    <script>
+    function openAllYahooBoards() {{
+        const urls = {urls_json};
+        for (const url of urls) {{
+            window.open(url, '_blank');
+        }}
+    }}
+    </script>
+    """
+    html(open_all_html, height=70)
 
     events_cache = {}
     if show_events:
